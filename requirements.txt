@@ -3,3 +3,4 @@ build
 pytest
 flake8
 twine
+geojson

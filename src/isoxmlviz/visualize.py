@@ -13,7 +13,7 @@ from shapely.geometry import LineString, JOIN_STYLE, MultiLineString, MultiPoint
 import math
 from isoxmlviz.LineStringUtil import extract_lines_within, get_coordinates
 from isoxmlviz.webmap import WebMap
-
+import json
 
 def PolygonPatch(polygon, **kwargs):
     """Constructs a matplotlib patch from a geometric object
@@ -106,6 +106,7 @@ def main():
     options = argparse.ArgumentParser(prog="isoxmlviz")
     options.add_argument("-file", dest="file", type=str, required=True, help='Path to a isoxml task file XML or ZIP')
     options.add_argument("-p", "--pdf", dest="pdf", action="store_true", required=False, help='Write figure to pdf')
+    options.add_argument("-g", "--geojson", dest="geojson", action="store_true", required=False, help='Write geometries to geojson')
     options.add_argument("-hide", "--hide", dest="hide", action="store_true", required=False, help='Hide plot')
     options.add_argument("-svg", "--svg", dest="svg", action="store_true", required=False, help='Write figure to svg')
     options.add_argument("-html", "--html", dest="html", action="store_true", required=False,
@@ -131,6 +132,10 @@ def main():
     hide_plot = False
     if args.hide:
         hide_plot = True
+    
+    export_geojson = False
+    if args.geojson:
+        export_geojson = True
 
     web_map = WebMap(0, 0)
     web_groups = WebGroups()
@@ -148,21 +153,21 @@ def main():
                             show_task_file(args.version_prefix, fname.replace('/', '_'), tree, save_pdf,
                                            gpn_filter=args.gpn_filter, save_svg=save_svg, hide=hide_plot,
                                            use_subplot=args.compact, web_map=web_map,
-                                           output_base_name=args.output_base_name, groups=web_groups)
+                                           output_base_name=args.output_base_name, groups=web_groups, export_geojson=export_geojson)
         else:
             if args.file.endswith("TASKDATA.xml"):
                 print("Invalid case in filename: '%s'" % args.file, file=sys.stderr)
             tree = ET.parse(args.file)
             show_task_file(args.version_prefix, Path(args.file).name, tree, save_pdf, gpn_filter=args.gpn_filter,
                            save_svg=save_svg, hide=hide_plot, use_subplot=args.compact, web_map=web_map,
-                           output_base_name=args.output_base_name, groups=web_groups)
+                           output_base_name=args.output_base_name, groups=web_groups, export_geojson=export_geojson)
 
         if args.html:
             web_map.save("map.html")
 
 
 def show_task_file(version_prefix, name, tree, save_pdf: bool = False, save_svg: bool = False, hide=False,
-                   gpn_filter=None, use_subplot=False, web_map=None, output_base_name=None, groups: WebGroups = None):
+                   gpn_filter=None, use_subplot=False, web_map=None, output_base_name=None, groups: WebGroups = None, export_geojson: bool = False):
     root = tree.getroot()
 
     if version_prefix is not None:
@@ -200,16 +205,27 @@ def show_task_file(version_prefix, name, tree, save_pdf: bool = False, save_svg:
     if not groups.field_name_group:
         groups.field_name_group = web_map.create_group("Field names")
 
+    if export_geojson:
+        import geojson
+        from shapely.geometry import mapping
+        features = []
+    
     for (ax, pfd) in part_fields_ax:
         if use_subplot:
             ax.title.set_text(pfd.attrib.get("C"))
-        plot_all_pln(ax, parent_map, web_map, ref, pfd, groups.polygon_type_groups)
+        boundaries = []
+        plot_all_pln(ax, parent_map, web_map, ref, pfd, groups.polygon_type_groups, boundaries)
         plot_all_lsg(ax, parent_map, web_map, ref, pfd, gpn_filter=gpn_filter, line_type_groups=groups.line_type_groups)
         plot_all_pnt(ax, parent_map, web_map, ref, pfd)
         plot_center_name(name, pfd, ref, web_map, group=groups.field_name_group)
 
         ax.axis("equal")
         ax.axis("off")
+        if geojson:
+            field_name = str(pfd.attrib.get("C"))
+            for polygon in boundaries:
+                geojson_feature = geojson.Feature(geometry=mapping(polygon), properties={'name': field_name})
+                features.append(geojson_feature)
     fig.tight_layout()
     # plt.legend(loc="upper left")
 
@@ -224,6 +240,13 @@ def show_task_file(version_prefix, name, tree, save_pdf: bool = False, save_svg:
 
     if not hide:
         plt.show()
+
+    if geojson:
+        geojson_collection = geojson.FeatureCollection(features)
+    
+        with open((output_base_name + ".geojson"), 'w') as f:
+            json.dump(geojson_collection, f, indent=2)
+        
 
     plt.figure().clear()
     plt.close()
@@ -242,11 +265,13 @@ def plot_center_name(name, pfd, ref, web_map, group=None):
     web_map.add_marker(name + '<br/> ' + field_name, MultiPoint(points).centroid, group=group)
 
 
-def get_line_points(ref, line: ET.ElementTree):
+def get_line_points(ref, line: ET.ElementTree, wgs84: bool = False):
     points_elements = line.findall('./PNT')
     if len(points_elements) == 0:
         return []
     point_data = [pnt_to_pair(pelement) for pelement in points_elements]
+    if wgs84:
+        return point_data
     points = [pymap3d.geodetic2enu(p[0], p[1], 0, ref[0], ref[1], 0, ell=ell_wgs84, deg=True) for p in
               point_data]
     return points
@@ -280,15 +305,25 @@ def get_polygon_with_interior(ref, pln, exterior_line):
 
     interiors = [SHP.Polygon([[p[0], p[1]] for p in g]) for g in interior_points]
 
-    return SHP.Polygon(exterior_points, [p.exterior.coords for p in interiors])
+    enu = SHP.Polygon(exterior_points, [p.exterior.coords for p in interiors])
+
+    points = get_line_points(ref, exterior_line, wgs84=True)
+    interior_points = [l for l in [get_line_points(ref, l) for l in pln.findall('./LSG[@A="2"]')] if l is not None]
+    exterior_points = [(p[1], p[0]) for p in points]
+
+    interiors = [SHP.Polygon([[p[1], p[0]] for p in g]) for g in interior_points]
+
+    wgs84 = SHP.Polygon(exterior_points, [p.exterior.coords for p in interiors])
+    
+    return enu, wgs84
 
 
-def plot_all_pln(ax, parent_map, web_map, ref, root, polygon_type_groups):
+def plot_all_pln(ax, parent_map, web_map, ref, root, polygon_type_groups, boundaries):
     for pln in root.findall(".//PLN"):
         designator = pln.attrib.get("C")
         print("Processing line '%s'" % designator)
 
-        for polygon in get_expanded_polygons(ref, pln):
+        for polygon, wgs84_polygon in get_expanded_polygons(ref, pln):
             # polygon = get_polygon(ref, pln)
             if polygon is None:
                 continue
@@ -309,6 +344,7 @@ def plot_all_pln(ax, parent_map, web_map, ref, root, polygon_type_groups):
                 group = polygon_type_groups[polygon_type]
 
             if polygon_type == 1:  # boundary
+                boundaries.append(wgs84_polygon)
                 patch = PolygonPatch(polygon.buffer(0), alpha=1, zorder=2, facecolor="black", linewidth=2, fill=False)
                 web_map.add(polygon, tooltip=designator, style={'color': 'black', 'fillOpacity': '0'}, group=group)
             elif polygon_type == 2:  # treatmentzone
